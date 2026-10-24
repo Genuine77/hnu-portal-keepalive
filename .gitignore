@@ -1,0 +1,20 @@
+# 本机运行时产生的凭据与状态文件，绝不能进版本库
+user.txt
+pass.txt
+keepalive.log
+portal.ip
+*.bak
+*.bak.*
+
+# 构建产物：Release 附件由 dist/ 单独打包，不提交
+dist/
+
+# build.ps1 的中间输出（正式产物是 windows/HNU-Portal.bat）
+windows/src/HNU-Portal.bat
+
+# 编辑器 / 系统垃圾
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

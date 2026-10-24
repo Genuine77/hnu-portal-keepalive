@@ -1,0 +1,9 @@
+# 换行与编码保护
+# HNU-Portal.bat 是 GBK 编码 + CRLF 换行的单文件入口，
+# 任何自动换行转换都会让它变成乱码，因此按二进制锁死字节。
+*.bat binary
+*.zip binary
+*.tar.gz binary
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.md text eol=lf

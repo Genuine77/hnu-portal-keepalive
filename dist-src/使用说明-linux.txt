@@ -1,0 +1,47 @@
+湖南大学 校园网自动保活 v1.0.0（Linux 版）
+================================================
+
+怎么用
+------
+  chmod +x HNU-Portal.sh        # 如果解压后没有执行权限
+  sudo bash HNU-Portal.sh
+
+然后输入 1，按提示输入校园网账号和密码即可。
+
+只想先看看脚本识别到的网卡和当前在线状态（不改动任何配置）：
+  sudo bash HNU-Portal.sh selftest
+
+装好之后
+--------
+systemd 每 2 分钟检测一次，掉认证自动重新登录。重启电脑后自动生效。
+
+菜单项：
+  1 = 安装 / 首次配置
+  2 = 改账号或密码
+  3 = 卸载（清理干净）
+  4 = 查看重新认证记录
+  5 = 立刻检测并重连一次
+  0 = 退出
+
+也可以用命令行直接跑一次：
+  sudo /usr/local/bin/hnu-portal run
+
+装在哪
+------
+  /usr/local/bin/hnu-portal                 程序
+  /etc/hnu-portal/user                      账号（600 root）
+  /etc/hnu-portal/pass                      密码（600 root）
+  /var/log/hnu-portal.log                   日志
+  /etc/systemd/system/hnu-portal.timer      定时器
+
+常用命令
+--------
+  systemctl list-timers hnu-portal.timer
+  sudo grep -E 'REAUTH (OK|FAIL)|NETDOWN' /var/log/hnu-portal.log | tail -20
+
+注意
+----
+- 免安装、无依赖，只需要系统自带的 curl（脚本会检查，缺了会提示怎么装）。
+- 这个 .sh 只是安装器兼运行程序，装完之后删掉不影响使用，但建议留一份方便改密码。
+- WSL 里跑没有意义：WSL2 的出口被 NAT 成 Windows 的 IP，门户看到的不是 Linux 自己的地址。
+- 只在本人设备、本人账号上使用。
