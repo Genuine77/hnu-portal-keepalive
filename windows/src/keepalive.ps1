@@ -2,12 +2,8 @@
 # 由 HNU-Portal.bat 释放到 %ProgramData%\HNU-Portal\ 后由计划任务以 SYSTEM 身份调用。
 # 也可单独运行：文件所在目录即为工作目录（凭据、日志都放在同目录）。
 #
-# 认证接口（2026-10-23 实测）：Dr.COM Portal 协议 :801
-#   GET http://web.hnu.edu.cn:801/eportal/?c=Portal&a=login&callback=dr1003&login_method=1
-#       &user_account=,0,<账号>&user_password=<密码>&wlan_user_ip=<本机IP>
-#       &wlan_user_mac=<MAC>&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.0&v=<随机>&lang=zh-cn&terminal_type=1
-#   成功返回 dr1003({"result":1,"msg":"Portal协议认证成功！"})
-# 注意：不要用 ?c=ACSetting&a=Login + DDDDD/upass，那套老接口在这台 AC 上恒返回 Auth Error(-199)。
+# 认证方式：检测到掉线后，调用校园网门户的登录接口完成重新认证。
+# 接口地址见下方 $phost / $pport；若门户升级导致地址或路径变化，改这两处即可。
 #
 # v4 变更（性能）：
 #   1. 探测提到最前面，204 直接退出。原顺序是先做网卡定位再探测，导致每次（哪怕在线）
@@ -15,7 +11,7 @@
 #   2. 需要重认证时才定位网卡，且改为纯 .NET：
 #        UDP connect 求"内核去门户所用的源 IP"（不发包）+ NetworkInterface 枚举取 MAC，
 #      不再依赖 Find-NetRoute / Get-NetAdapter / Get-NetIPAddress。
-#   3. 效果：在线态单次 CPU 降到约 1/3（详见 chat 里的实测对比）。
+#   3. 效果：在线态单次 CPU 降到约 1/3（实测数据见 CHANGELOG）。
 
 $ErrorActionPreference = 'SilentlyContinue'
 

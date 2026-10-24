@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# HNU-Portal.sh —— 湖南大学 Dr.COM 校园网自动保活（Linux 单文件版）
+# HNU-Portal.sh —— 校园网自动保活（Linux 单文件版）
 #
 # 用法:
 #   sudo ./HNU-Portal.sh            交互菜单（推荐）
@@ -15,18 +15,12 @@
 #   日志   /var/log/hnu-portal.log
 #   调度   systemd timer；无 systemd 时自动退回 /etc/cron.d/hnu-portal
 #
-# 认证协议（2026-10 在 HNU 实测）:
-#   GET http://web.hnu.edu.cn:801/eportal/?c=Portal&a=login&callback=dr1003
-#       &login_method=1&user_account=,0,<账号>&user_password=<密码>
-#       &wlan_user_ip=<本机IP>&wlan_user_mac=<MAC>&wlan_ac_ip=&wlan_ac_name=
-#       &jsVersion=4.0&lang=zh-cn&terminal_type=1
-#   成功返回 dr1003({"result":1,"msg":"Portal协议认证成功！"})
-#
-#   注: 老的 ?c=ACSetting&a=Login + DDDDD/upass 接口在这台 AC 上恒返回
-#       "Error code: 205 Auth Error(-199)"，与密码正确与否无关，勿再使用。
+# 认证方式:
+#   检测到掉线后，向校园网门户的登录接口提交一次认证请求，成功即恢复。
+#   接口地址见下方 PORTAL_HOST / PORTAL_PORT；门户升级导致地址变化时改这两处。
 #
 # 可移植性要点:
-#   - 不再写死 10.123.* 网段，改为"按到门户的路由"自动定位网卡:
+#   - 不再写死固定网段，改为"按到门户的路由"自动定位网卡:
 #       ip route get <门户IP>  →  dev / src
 #   - DNS 失效时用缓存的 portal IP + curl --resolve 兜底
 #   - 探测返回 000（链路/DNS 不通）不盲目登录，只记一条 NETDOWN
@@ -337,7 +331,7 @@ install_scheduler() {
         systemd)
             cat > "$UNIT_SVC" <<EOF
 [Unit]
-Description=HNU Dr.COM Portal keepalive
+Description=HNU Portal keepalive
 Documentation=file://$BIN_PATH
 After=network-online.target
 Wants=network-online.target
