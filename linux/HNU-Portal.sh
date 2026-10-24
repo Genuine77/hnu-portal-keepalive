@@ -23,12 +23,12 @@
 #   - 不再写死固定网段，改为"按到门户的路由"自动定位网卡:
 #       ip route get <门户IP>  →  dev / src
 #   - DNS 失效时用缓存的 portal IP + curl --resolve 兜底
-#   - 探测返回 000（链路/DNS 不通）不盲目登录，只记一条 NETDOWN
+#   - 探测重试 3 次仍为 000 才判定不通，不盲目登录，只记一条 NETDOWN
 #   - 账号/密码存 600 root；密码输入不回显，明文不落脚本
 
 set -u
 
-VERSION='1.0.0'
+VERSION='1.0.1'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
@@ -166,11 +166,41 @@ detect_net() {
     [ -n "$MYMAC" ] && cache_put "$MAC_CACHE" "$MYMAC"
 }
 
+# 单次探测，返回 "状态码|对端IP"
+probe_detail() {
+    local out code ip
+    out=$(curl -4 -s -m 6 --connect-timeout 3 -o /dev/null \
+          -w '%{http_code} %{remote_ip}' "$PROBE_URL" 2>/dev/null)
+    code=$(printf '%s' "$out" | cut -d' ' -f1)
+    ip=$(printf '%s' "$out" | cut -d' ' -f2)
+    [ -z "$code" ] && code='000'
+    printf '%s|%s' "$code" "$ip"
+}
+
+# 探测（带重试）：拿到 204/302 就返回
+# 两种情况下重试而不是直接判死：
+#   1) 000：上游偶发丢弃 SYN，本机其实没掉线（实测首次连接较容易踩中）
+#   2) 解析落在 198.18.0.0/15：代理软件 fake-IP 劫持 DNS 时返回的伪造地址，
+#      发出去必然无回应，必须丢弃重解析
 probe() {
-    local c
-    c=$(curl -4 -s -m 8 -o /dev/null -w '%{http_code}' "$PROBE_URL" 2>/dev/null)
-    [ -z "$c" ] && c='000'
-    printf '%s' "$c"
+    local i d code ip
+    i=1
+    while [ "$i" -le 3 ]; do
+        d=$(probe_detail)
+        code=${d%%|*}
+        ip=${d##*|}
+        case "$code" in
+            204|302)
+                case "$ip" in
+                    198.18.*|198.19.*) ;;
+                    *) printf '%s' "$code"; return 0 ;;
+                esac
+                ;;
+        esac
+        [ "$i" -lt 3 ] && sleep 1
+        i=$((i + 1))
+    done
+    printf '000'
 }
 
 # 门户首页里下发的 ss1（历史/令牌值），作为 MAC 被拒时的回退
@@ -263,11 +293,17 @@ do_run() {
         sleep 5
         code=$(probe)
         if [ "$code" = '000' ]; then
-            local last=''
+            local last='' d ip
             [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
+            d=$(probe_detail); ip=${d##*|}
             case "$last" in
                 *NETDOWN*) : ;;
-                *) log_msg "NETDOWN    probe=000（链路/DNS 不通，本轮跳过登录）" ;;
+                *)
+                    case "$ip" in
+                        198.18.*|198.19.*) log_msg "NETDOWN    probe=000（DNS 被劫持到伪造地址 $ip，本轮跳过登录）" ;;
+                        *) log_msg "NETDOWN    probe=000（重试 3 次仍不通，本轮跳过登录）" ;;
+                    esac
+                    ;;
             esac
             exit 0
         fi
@@ -512,7 +548,7 @@ show_online_state() {
     case "$c" in
         204) printf '%s已认证在线%s' "$C_GRN" "$C_OFF" ;;
         302) printf '%s未认证（需要登录）%s' "$C_YEL" "$C_OFF" ;;
-        000) printf '%s网络不通（链路或 DNS）%s' "$C_RED" "$C_OFF" ;;
+        000) printf '%s探测不通（已重试 3 次）%s' "$C_RED" "$C_OFF" ;;
         *)   printf '未知（%s）' "$c" ;;
     esac
 }

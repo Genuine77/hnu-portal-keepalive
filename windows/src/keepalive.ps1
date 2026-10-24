@@ -32,9 +32,15 @@ function Write-Log([string]$msg) {
 }
 
 function Get-ProbeCode {
-    $c = & curl.exe -4 -s -m 8 -o NUL -w '%{http_code}' $probe 2>$null
-    if ([string]::IsNullOrWhiteSpace($c)) { $c = '000' }
-    return "$c".Trim()
+    # 单次探测可能被上游丢掉连接（本机并未掉线时也会返回 000），因此重试 3 次
+    for ($i = 1; $i -le 3; $i++) {
+        $c = & curl.exe -4 -s -m 6 --connect-timeout 3 -o NUL -w '%{http_code}' $probe 2>$null
+        if ([string]::IsNullOrWhiteSpace($c)) { $c = '000' }
+        $c = "$c".Trim()
+        if ($c -eq '204' -or $c -eq '302') { return $c }
+        if ($i -lt 3) { Start-Sleep -Seconds 1 }
+    }
+    return '000'
 }
 
 # ---------- 前置检查 ----------
