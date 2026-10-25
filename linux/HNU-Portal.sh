@@ -33,10 +33,15 @@
 #   请求被隧道接管，于是"VPN 能不能上网"冒充了"校园网通不通"——校园网断了
 #   探针照样回 204，脚本就地退出、永不重认证。改用固定公网 IP 直连，
 #   并用响应里的对端地址反查是否被劫持。
+#
+# v1.0.4 变更:
+#   门户地址改为"缓存优先"：缓存里的地址只要还能自证是门户就直接用，不再先问 DNS。
+#   原来是 DNS 优先、缓存兜底，DNS 一旦被劫持到一个"格式合法"的地址（不一定落在
+#   198.18.x），就会覆盖缓存；新解析出的地址也必须真的返回门户页面才允许写进缓存。
 
 set -u
 
-VERSION='1.0.3'
+VERSION='1.0.4'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
@@ -154,29 +159,48 @@ portal_reachable() {
     [ "$code" != '000' ]
 }
 
-# 解析门户域名，成功则刷新缓存；失败则回退缓存
+# 确认地址背后真的是认证门户：HTTP 200 且页面带 EPortal 特征。
+# 只校验 IP 格式不够：DNS 被劫持（或域名恰好有公网记录）时，
+# 一个格式完全合法的地址照样会被当成门户，写进缓存后每次登录都发错地方。
+portal_identity() {
+    local ip=${1:-} body
+    valid_ip "$ip" || return 1
+    body=$(curl -4 --noproxy '*' -s -m 8 --connect-timeout 3 \
+           --resolve "$PORTAL_HOST:$PORTAL_PORT:$ip" \
+           "http://$PORTAL_HOST:$PORTAL_PORT/eportal/" 2>/dev/null)
+    [ -n "$body" ] || return 1
+    printf '%s' "$body" | grep -qi 'eportal'
+}
+
+# 域名解析出的候选地址（去重）
+portal_candidates() {
+    { have getent   && getent ahostsv4 "$PORTAL_HOST" 2>/dev/null | awk '{print $1}'
+      have dig      && dig +short A "$PORTAL_HOST" 2>/dev/null
+      have nslookup && nslookup "$PORTAL_HOST" 2>/dev/null | awk '/^Address:[ \t]/{print $2}'
+    } 2>/dev/null | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | awk '!seen[$0]++'
+}
+
+# 确定门户地址：缓存优先，缓存不可用才解析，且新地址必须自证是门户才落盘
 resolve_portal_ip() {
-    local ip=''
-    if have getent; then
-        ip=$(getent ahostsv4 "$PORTAL_HOST" 2>/dev/null | awk 'NR==1{print $1}')
-    fi
-    if { [ -z "$ip" ] || ! valid_ip "$ip"; } && have dig; then
-        ip=$(dig +short A "$PORTAL_HOST" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
-    fi
-    if { [ -z "$ip" ] || ! valid_ip "$ip"; } && have nslookup; then
-        ip=$(nslookup "$PORTAL_HOST" 2>/dev/null | awk '/^Address:[ \t]/{print $2}' | grep -E '^[0-9.]+$' | tail -n1)
-    fi
-    # 解析结果必须过校验才允许写缓存：开着代理软件时域名可能被答成 198.18.x，
-    # 这种地址一旦缓存下来，之后每次登录都会发进黑洞
-    if [ -n "$ip" ] && valid_ip "$ip"; then
-        cache_put "$IP_CACHE" "$ip"
-        printf '%s' "$ip"
-        return 0
-    fi
+    local ip cand
+    # 1) 缓存只要还能自证是门户就直接用，完全不碰 DNS
     if [ -r "$IP_CACHE" ]; then
         ip=$(tr -d ' \r\n' < "$IP_CACHE")
-        if valid_ip "$ip"; then printf '%s' "$ip"; return 0; fi
+        if [ -n "$ip" ] && portal_identity "$ip"; then
+            printf '%s' "$ip"; return 0
+        fi
     fi
+    # 缓存不可信时顺手清掉，免得一个坏地址一直留在盘上
+    rm -f "$IP_CACHE" 2>/dev/null || true
+    # 2) 缓存不可用才解析；候选必须自证是门户，才允许写进缓存
+    for cand in $(portal_candidates); do
+        if portal_identity "$cand"; then
+            cache_put "$IP_CACHE" "$cand"
+            printf '%s' "$cand"; return 0
+        fi
+    done
+    # 3) 缓存和 DNS 都没能验明正身，就不要拿它们去登录了（大概率是假地址）
+    log_msg "PORTAL     缓存与 DNS 均未验证出门户地址，本轮不带地址尝试登录"
     printf ''
 }
 
@@ -340,26 +364,33 @@ do_run() {
     if [ "$code" = '000' ]; then
         # probe=000 有两种情况：真断网，或 DNS 不可用（未认证时校园 DNS 常被挡，
         # 也可能被代理软件劫持成 fake-IP）。后者必须继续登录，否则整轮跳过、一直不恢复。
+        # 缓存里的地址本身也可能已经坏了（曾被 DNS 污染过），所以不通时要再确认一次，
+        # 不能因为一个坏缓存就把整轮判成断网。
         if portal_reachable "$pip"; then
             log_msg "PROBE      probe=000 但门户可达（$pip），判定为掉认证而非断网，继续登录"
         else
-            sleep 5
-            code=$(probe)
-            [ "$code" = '204' ] && exit 0
-            if [ "$code" = '000' ] && ! portal_reachable "$pip"; then
-                local last='' d ip rest
-                [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
-                d=$(probe_detail "${PROBE_URLS%% *}"); rest=${d#*|}; ip=${rest%%|*}
-                case "$last" in
-                    *NETDOWN*) : ;;
-                    *)
-                        case "$ip" in
-                            198.18.*|198.19.*) log_msg "NETDOWN    probe=000（DNS 被劫持到伪造地址 $ip，本轮跳过登录）" ;;
-                            *) log_msg "NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过" ;;
-                        esac
-                        ;;
-                esac
-                exit 0
+            pip=$(resolve_portal_ip)
+            if [ -n "$pip" ]; then
+                log_msg "PROBE      probe=000，重新确认到门户地址（$pip），判定为掉认证而非断网，继续登录"
+            else
+                sleep 5
+                code=$(probe)
+                [ "$code" = '204' ] && exit 0
+                if [ "$code" = '000' ]; then
+                    local last='' d ip rest
+                    [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
+                    d=$(probe_detail "${PROBE_URLS%% *}"); rest=${d#*|}; ip=${rest%%|*}
+                    case "$last" in
+                        *NETDOWN*) : ;;
+                        *)
+                            case "$ip" in
+                                198.18.*|198.19.*) log_msg "NETDOWN    probe=000（DNS 被劫持到伪造地址 $ip，本轮跳过登录）" ;;
+                                *) log_msg "NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过" ;;
+                            esac
+                            ;;
+                    esac
+                    exit 0
+                fi
             fi
         fi
     fi

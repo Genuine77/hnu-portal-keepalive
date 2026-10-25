@@ -1,4 +1,4 @@
-﻿# HNU 校园网自动保活（可移植版 v6）
+﻿# HNU 校园网自动保活（可移植版 v7）
 # 由 HNU-Portal.bat 释放到 %ProgramData%\HNU-Portal\ 后由计划任务以 SYSTEM 身份调用。
 # 也可单独运行：文件所在目录即为工作目录（凭据、日志都放在同目录）。
 #
@@ -25,6 +25,13 @@
 #   请求随即被隧道接管。结果是「VPN 能不能上外网」冒充了「校园网通不通」：
 #   校园网早断了，探针照样回 204，脚本就地退出，一次也不会去重新认证。
 #   现在探针改用固定公网 IP 直连，并用响应里的 remote_ip 反查是否被劫持。
+#
+# v7 变更（门户地址不被污染）：
+#   1. 门户地址改为"缓存优先"：缓存里的地址只要还能自证是门户就直接用，不再先问 DNS。
+#      原来是 DNS 优先、缓存兜底，DNS 一旦被劫持到一个"格式合法"的地址（不一定落在
+#      198.18.x），就会把缓存覆盖掉，之后每次登录都发错地方。
+#   2. 新解析出的地址必须真的返回门户页面（带 EPortal 特征）才允许写进缓存，
+#      只过格式校验不算数。
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -105,6 +112,52 @@ function Test-PortalReachable([string]$ip) {
     return ("$c".Trim() -ne '000')
 }
 
+function Test-PortalIdentity([string]$ip) {
+    # 确认这个地址背后真的是认证门户：返回 200 且页面带 EPortal 特征。
+    # 只校验 IP 格式是不够的——DNS 被劫持（或域名恰好存在公网记录）时，
+    # 一个格式完全合法的地址照样会被当成门户，一旦写进缓存，之后每次登录都发错地方。
+    if (-not (Test-PortalIP $ip)) { return $false }
+    $body = & curl.exe -4 --noproxy '*' -s -m 8 --connect-timeout 3 `
+            --resolve "${phost}:${pport}:$ip" $portal 2>$null
+    if (-not $body) { return $false }
+    return (($body -join "`n") -match '(?i)EPortal')
+}
+
+function Resolve-PortalIP {
+    # 确定门户地址：缓存优先（不轻易碰 DNS），新地址必须自证是门户才写缓存。
+    # 返回空字符串 = 缓存和 DNS 都没能验证出可信地址。
+    $cached = ''
+    if (Test-Path $ipf) { $cached = (Get-Content $ipf -Raw).Trim() }
+
+    if (Test-PortalIdentity $cached) { return $cached }
+
+    # 缓存不可信时顺手清掉，免得一个坏地址一直留在盘上
+    if ($cached -and (Test-Path $ipf)) { Remove-Item $ipf -Force -ErrorAction SilentlyContinue }
+
+    $cands = @()
+    try {
+        $cands = [System.Net.Dns]::GetHostAddresses($phost) |
+                 Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                 ForEach-Object { $_.IPAddressToString }
+    } catch {}
+    foreach ($c in $cands) {
+        if (-not (Test-PortalIP $c)) {
+            Write-Log "DNS        解析到 $c（不在可信范围，已忽略）"
+            continue
+        }
+        if (Test-PortalIdentity $c) {
+            Set-Content -Path $ipf -Value $c -Encoding ASCII
+            if ($cached -and $cached -ne $c) {
+                Write-Log "PORTAL     门户地址由 $cached 改为 $c（旧地址已失效，新地址已验证）"
+            }
+            return $c
+        }
+        Write-Log "DNS        解析到 $c（连不上门户或不像门户，已忽略）"
+    }
+    if ($cached) { Write-Log "PORTAL     缓存与 DNS 均未验证出门户地址（原缓存 $cached）" }
+    return ''
+}
+
 function Repair-NetState([string]$ip) {
     # Windows 的"是否有 Internet"判定（NCSI）不会自己复查：它在认证之前就把网络
     # 标记成"需要登录的门户"，之后只有链路重新上线才会重测。于是会出现网已经通了、
@@ -151,6 +204,7 @@ if ((Test-Path $log) -and ((Get-Item $log).Length -gt 204800)) {
 $code = Get-ProbeCode
 if ($code -eq '204') { exit 0 }
 
+$resolvedPortal = ''
 if ($code -eq '000') {
     # probe=000 有两种完全不同的情况：
     #   1. 真的断网；
@@ -158,34 +212,40 @@ if ($code -eq '000') {
     # 第 2 种必须继续登录，否则会像旧版那样：明明只是掉认证，却整轮跳过、一直不恢复。
     $cached = ''
     if (Test-Path $ipf) { $cached = (Get-Content $ipf -Raw).Trim() }
-    if (-not (Test-PortalReachable $cached)) {
+    # 缓存里的地址本身也可能是坏的（曾被 DNS 污染过），所以不通时要再重新确认一次，
+    # 不能因为一个坏缓存就把整轮判成断网。
+    if (Test-PortalReachable $cached) {
+        Write-Log "PROBE       probe=000 但门户可达（$cached），判定为掉认证而非断网，继续登录"
+    } else {
+        $resolvedPortal = Resolve-PortalIP
+        if ($resolvedPortal) {
+            Write-Log "PROBE       probe=000，重新确认到门户地址（$resolvedPortal），判定为掉认证而非断网，继续登录"
+        } else {
+            $cached = ''
+        }
+    }
+    if (-not $cached -and -not $resolvedPortal) {
         Start-Sleep -Seconds 5
         $code = Get-ProbeCode
         if ($code -eq '204') { exit 0 }
-        if ($code -eq '000' -and -not (Test-PortalReachable $cached)) {
+        if ($code -eq '000') {
             $last = ''
             if (Test-Path $log) { $last = (Get-Content $log -Tail 1) -join '' }
             if ($last -notmatch 'NETDOWN') { Write-Log "NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过 | $($script:lastProbe)" }
             exit 0
         }
-    } else {
-        Write-Log "PROBE       probe=000 但门户可达（$cached），判定为掉认证而非断网，继续登录"
     }
 }
 
-# ---------- 第二步：确实需要重认证，这时才解析门户 IP ----------
-# 解析结果必须过校验：VPN/代理的 fake-IP 会把域名答成 198.18.x 这类地址，
-# 直接拿来登录必然失败，而且会把这个坏地址写进缓存、让下次也失败。
-$pip = ''
-$cachedIP = ''
-if (Test-Path $ipf) { $cachedIP = (Get-Content $ipf -Raw).Trim() }
-try {
-    $a = [System.Net.Dns]::GetHostAddresses($phost) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
-    if ($a -and (Test-PortalIP $a.IPAddressToString)) { $pip = $a.IPAddressToString }
-    elseif ($a) { Write-Log "DNS        解析到 $($a.IPAddressToString)（不在可信范围，已忽略）" }
-} catch {}
-if (-not $pip -and (Test-PortalIP $cachedIP)) { $pip = $cachedIP }
-if ($pip) { Set-Content -Path $ipf -Value $pip -Encoding ASCII }
+# ---------- 第二步：确定门户地址（缓存优先，不让 DNS 有机会覆盖）----------
+# 见 Resolve-PortalIP：缓存能自证是门户就直接用，一步 DNS 都不做；
+# 只有缓存不可用时才解析，且候选地址必须同样自证是门户才允许写进缓存。
+$pip = $resolvedPortal
+if (-not $pip) { $pip = Resolve-PortalIP }
+if (-not $pip) {
+    # 缓存和 DNS 都没能验明正身，就不要拿它们去登录了（大概率是假地址）
+    Write-Log "PORTAL     缓存与 DNS 均未验证出门户地址，本轮不带地址尝试登录"
+}
 
 # ---------- 第三步：定位网卡（纯 .NET，可移植，不写死网段）----------
 # UDP connect 只是让内核选出出口网卡并给出源地址，不握手、不发包
