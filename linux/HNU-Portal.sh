@@ -12,6 +12,7 @@
 # 安装后落点:
 #   程序   /usr/local/bin/hnu-portal
 #   配置   /etc/hnu-portal/user 、 /etc/hnu-portal/pass     (600 root)
+#   缓存   /etc/hnu-portal/portal.ip 、 /etc/hnu-portal/mac （跨重启保留）
 #   日志   /var/log/hnu-portal.log
 #   调度   systemd timer；无 systemd 时自动退回 /etc/cron.d/hnu-portal
 #
@@ -38,10 +39,15 @@
 #   门户地址改为"缓存优先"：缓存里的地址只要还能自证是门户就直接用，不再先问 DNS。
 #   原来是 DNS 优先、缓存兜底，DNS 一旦被劫持到一个"格式合法"的地址（不一定落在
 #   198.18.x），就会覆盖缓存；新解析出的地址也必须真的返回门户页面才允许写进缓存。
+#
+# v1.0.5 变更:
+#   缓存从 /run（tmpfs，重启即空）搬到 /etc/hnu-portal，跨重启保留。
+#   此前每次重启后缓存都是空的，v1.0.4 的"缓存优先"在开机第一轮完全失效，
+#   只能退回解析域名；若此时 DNS 恰被代理软件劫持，就会一直登不上。升级时自动搬运旧缓存。
 
 set -u
 
-VERSION='1.0.4'
+VERSION='1.0.5'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
@@ -51,9 +57,15 @@ CONF_DIR='/etc/hnu-portal'
 USER_FILE="$CONF_DIR/user"
 PASS_FILE="$CONF_DIR/pass"
 LOG_FILE='/var/log/hnu-portal.log'
+# 锁必须是进程级、不必跨开机保留，放 tmpfs 正合适
 LOCK_FILE='/run/hnu-portal.lock'
-IP_CACHE='/run/hnu-portal.ip'
-MAC_CACHE='/run/hnu-portal.mac'
+# 缓存必须跨重启保留（/run 是 tmpfs，重启即空），否则重启后第一轮只能退回解析域名
+IP_CACHE="$CONF_DIR/portal.ip"
+MAC_CACHE="$CONF_DIR/mac"
+
+# v1.0.4 及更早把缓存写在 /run 下，升级时自动搬过来
+LEGACY_IP_CACHE='/run/hnu-portal.ip'
+LEGACY_MAC_CACHE='/run/hnu-portal.mac'
 BIN_PATH='/usr/local/bin/hnu-portal'
 
 UNIT_DIR='/etc/systemd/system'
@@ -129,7 +141,25 @@ ensure_curl() {
 # ------------------------------------------------------------ 网络探测 ----
 # 安全写缓存：文件不可写时（非 root）静默跳过，不打印 shell 重定向错误
 cache_put() {
-    ( printf '%s\n' "$2" > "$1" ) 2>/dev/null || true
+    local f="$1" d
+    d=$(dirname "$f")
+    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
+    ( printf '%s\n' "$2" > "$f" ) 2>/dev/null || true
+}
+
+# 把 v1.0.4 及更早留在 /run 的缓存搬到持久目录。
+# 只在"新位置还没有"时搬，避免用开机残留的旧值覆盖当前有效值。
+cache_migrate() {
+    local src dst
+    for pair in "$LEGACY_IP_CACHE:$IP_CACHE" "$LEGACY_MAC_CACHE:$MAC_CACHE"; do
+        src=${pair%%:*}; dst=${pair##*:}
+        [ -f "$src" ] || continue
+        [ -s "$dst" ] && continue
+        local v
+        v=$(tr -d ' \r\n' < "$src" 2>/dev/null)
+        [ -n "$v" ] || continue
+        cache_put "$dst" "$v"
+    done
 }
 
 # 地址可信性校验：回环、链路本地、组播/保留段、代理软件 fake-IP 段一律不采纳。
@@ -347,6 +377,7 @@ do_run() {
     fi
 
     mkdir -p /run 2>/dev/null || true
+    cache_migrate
     rotate_log
 
     detect_net
@@ -573,6 +604,7 @@ install_files() {
     [ -f "$BIN_PATH" ] || first=1
 
     migrate_legacy
+    cache_migrate
     ensure_curl || return 1
 
     # 把自身装到系统路径（装完即可脱离原文件）
@@ -733,7 +765,8 @@ act_uninstall() {
         *) say '已取消'; pause_; return 0 ;;
     esac
     remove_scheduler
-    rm -f "$BIN_PATH" "$LOG_FILE" "$IP_CACHE" "$MAC_CACHE" "$LOCK_FILE"
+    rm -f "$BIN_PATH" "$LOG_FILE" "$IP_CACHE" "$MAC_CACHE" "$LOCK_FILE" \
+          "$LEGACY_IP_CACHE" "$LEGACY_MAC_CACHE"
     rm -rf "$CONF_DIR"
     ok "已卸载"
     note "旧版遗留（如存在）需自行删除：$LEGACY_BIN 、$LEGACY_USER 、$LEGACY_PASS"
