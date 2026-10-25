@@ -48,6 +48,26 @@ systemctl list-timers hnu-portal.timer
 
 **处理**：重新从 Release 下载原始文件，不要用编辑器打开后另存。
 
+## Windows：双击 BAT 窗口一闪就没了，或报"输入行太长"
+
+```
+输入行太长。
+命令语法不正确。
+```
+
+**原因**：v1.0.5 及更早的安装包里有个缺陷——它把内嵌脚本的整段 base64 直接写进同一条命令，而 `cmd.exe` 单条命令行上限是 8191 字符。脚本变大之后展开长度超过上限，这条命令必然失败，双击就闪退。
+
+**为什么老机器上没遇到**：已经装过的机器 `%ProgramData%\HNU-Portal\keepalive.ps1` 已存在，这段释放逻辑会被直接跳过。所以它只在**全新机器**上暴露，看起来很像"某台电脑不兼容"，其实是版本问题。
+
+**处理**：换用 v1.0.6 或更新的安装包。若已经装了旧版且能正常跑，可以不动。
+
+**自查方法**（想确认旧包是否受影响）：
+
+```bat
+findstr /C:"FromBase64String" HNU-Portal.bat >nul && echo 旧写法
+findstr /C:"ReadAllText" HNU-Portal.bat >nul && echo 新写法（分片写文件）
+```
+
 ## Windows：计划任务返回码不是 0
 
 | 返回码 | 含义 |

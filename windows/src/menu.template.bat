@@ -17,12 +17,15 @@ exit /b
 pushd "%~dp0"
 
 rem ==================== 内嵌核心脚本（gzip + base64） ====================
+rem 这里只做分片赋值（每片一行）。写文件和拼接都在 :EXTRACT_PS1 里逐行进行，
+rem 绝不能把整段 base64 拼进同一条命令：cmd.exe 单条命令行上限 8191 字符，
+rem 脚本稍大一点就会整行溢出，报"输入行太长"+"命令语法不正确"。
 {{CHUNKS}}
 
 :MENU
 cls
 echo ============================================================
-echo    湖南大学 校园网自动保活   v1.0.5
+echo    湖南大学 校园网自动保活   v1.0.6
 echo ============================================================
 if exist "%PS1%" (echo    状态: 已安装) else (echo    状态: 尚未安装)
 echo ------------------------------------------------------------
@@ -50,8 +53,21 @@ if exist "%PS1%" goto :EOF
 
 :EXTRACT_PS1
 if not exist "%BASE%" mkdir "%BASE%" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$b=[Convert]::FromBase64String('%B64%');$ms=New-Object IO.MemoryStream(,$b);$gz=New-Object IO.Compression.GzipStream($ms,[IO.Compression.CompressionMode]::Decompress);$o=New-Object IO.MemoryStream;$gz.CopyTo($o);$gz.Dispose();[IO.File]::WriteAllBytes('%PS1%',$o.ToArray())"
-if exist "%PS1%" (echo   [OK] 核心脚本已就绪) else (echo   [X] 释放失败，请检查杀毒软件是否拦截)
+set "B64F=%TEMP%\hnu-portal-payload.b64"
+del "%B64F%" >nul 2>&1
+{{WRITE}}
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[IO.File]::ReadAllText('%B64F%');$b=[Convert]::FromBase64String($s);$ms=New-Object IO.MemoryStream(,$b);$gz=New-Object IO.Compression.GzipStream($ms,[IO.Compression.CompressionMode]::Decompress);$o=New-Object IO.MemoryStream;$gz.CopyTo($o);$gz.Dispose();[IO.File]::WriteAllBytes('%PS1%',$o.ToArray())"
+del "%B64F%" >nul 2>&1
+if exist "%PS1%" goto :EXTRACT_OK
+echo.
+echo   [X] 释放核心脚本失败
+echo       常见原因：杀毒软件拦截、%TEMP% 不可写
+echo       可手动核对：%%ProgramData%%\HNU-Portal\keepalive.ps1 是否存在
+echo.
+pause
+goto :EOF
+:EXTRACT_OK
+echo   [OK] 核心脚本已就绪
 goto :EOF
 
 rem ==================== 1 / 2 输入账号密码 ====================

@@ -47,7 +47,7 @@
 
 set -u
 
-VERSION='1.0.5'
+VERSION='1.0.6'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
