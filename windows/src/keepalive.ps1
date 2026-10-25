@@ -12,6 +12,13 @@
 #        UDP connect 求"内核去门户所用的源 IP"（不发包）+ NetworkInterface 枚举取 MAC，
 #      不再依赖 Find-NetRoute / Get-NetAdapter / Get-NetIPAddress。
 #   3. 效果：在线态单次 CPU 降到约 1/3（实测数据见 CHANGELOG）。
+#
+# v5 变更（可靠性）：
+#   1. 探测拿不到 204 时不再一律当作断网：先用缓存的门户 IP 判断门户是否可达，
+#      可达就照常登录。修复"DNS 被挡/被劫持时整轮跳过、迟迟不恢复"。
+#   2. 解析到的门户 IP 必须过校验（排除回环、链路本地、组播与 198.18.0.0/15 等
+#      代理软件 fake-IP 段），坏地址不会写进缓存。
+#   3. 认证成功后主动唤醒 Windows 的联网判定（NCSI），避免网已通、任务栏仍显示断网。
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -34,13 +41,64 @@ function Write-Log([string]$msg) {
 function Get-ProbeCode {
     # 单次探测可能被上游丢掉连接（本机并未掉线时也会返回 000），因此重试 3 次
     for ($i = 1; $i -le 3; $i++) {
-        $c = & curl.exe -4 -s -m 6 --connect-timeout 3 -o NUL -w '%{http_code}' $probe 2>$null
+        $c = & curl.exe -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o NUL -w '%{http_code}' $probe 2>$null
         if ([string]::IsNullOrWhiteSpace($c)) { $c = '000' }
         $c = "$c".Trim()
         if ($c -eq '204' -or $c -eq '302') { return $c }
         if ($i -lt 3) { Start-Sleep -Seconds 1 }
     }
     return '000'
+}
+
+function Test-PortalIP([string]$ip) {
+    # 只接受可信的门户地址。开着 VPN / 代理的 fake-IP 时，DNS 会把域名解析成
+    # 198.18.0.0/15 之类的保留段地址，这种地址一旦写进缓存，登录请求等于发进黑洞。
+    if ([string]::IsNullOrWhiteSpace($ip)) { return $false }
+    $o = $ip.Split('.')
+    if ($o.Count -ne 4) { return $false }
+    foreach ($x in $o) {
+        if ($x -notmatch '^\d{1,3}$') { return $false }
+        if ([int]$x -gt 255) { return $false }
+    }
+    $a = [int]$o[0]; $b = [int]$o[1]
+    if ($a -eq 0 -or $a -ge 224) { return $false }
+    if ($a -eq 127) { return $false }
+    if ($a -eq 169 -and $b -eq 254) { return $false }
+    if ($a -eq 198 -and $b -ge 18 -and $b -le 19) { return $false }
+    return $true
+}
+
+function Test-PortalReachable([string]$ip) {
+    # 不依赖 DNS，直接用 IP 判断门户是否可达：可达说明链路正常，只是还没认证
+    if (-not (Test-PortalIP $ip)) { return $false }
+    $c = & curl.exe -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o NUL -w '%{http_code}' `
+        --resolve "${phost}:${pport}:$ip" $portal 2>$null
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    return ("$c".Trim() -ne '000')
+}
+
+function Repair-NetState([string]$ip) {
+    # Windows 的"是否有 Internet"判定（NCSI）不会自己复查：它在认证之前就把网络
+    # 标记成"需要登录的门户"，之后只有链路重新上线才会重测。于是会出现网已经通了、
+    # 任务栏却一直显示断网图标的情况。这里用一次网卡重启把判定唤醒。
+    try {
+        Start-Sleep -Seconds 2
+        $alias = (Get-NetIPAddress -IPAddress $ip -AddressFamily IPv4 -ErrorAction Stop |
+                  Select-Object -First 1).InterfaceAlias
+        if ([string]::IsNullOrWhiteSpace($alias)) { return }
+        $conn = Get-NetConnectionProfile -InterfaceAlias $alias -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        if ($conn -and $conn.IPv4Connectivity -eq 'Internet') { return }
+        Write-Log "NETSTATE   IPv4=$($conn.IPv4Connectivity)（系统未认出已联网）→ 重启网卡刷新判定"
+        Restart-NetAdapter -Name $alias -Confirm:$false -ErrorAction Stop
+        Start-Sleep -Seconds 10
+        $c2 = Get-ProbeCode
+        $conn2 = Get-NetConnectionProfile -InterfaceAlias $alias -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        Write-Log "NETSTATE   after=$c2 IPv4=$($conn2.IPv4Connectivity)"
+    } catch {
+        Write-Log "NETSTATE   刷新失败：$($_.Exception.Message)"
+    }
 }
 
 # ---------- 前置检查 ----------
@@ -66,24 +124,39 @@ $code = Get-ProbeCode
 if ($code -eq '204') { exit 0 }
 
 if ($code -eq '000') {
-    Start-Sleep -Seconds 5
-    $code = Get-ProbeCode
-    if ($code -eq '000') {
-        $last = ''
-        if (Test-Path $log) { $last = (Get-Content $log -Tail 1) -join '' }
-        if ($last -notmatch 'NETDOWN') { Write-Log 'NETDOWN    probe=000（链路/DNS 不通，本轮跳过登录）' }
-        exit 0
+    # probe=000 有两种完全不同的情况：
+    #   1. 真的断网；
+    #   2. DNS 不可用（未认证时校园 DNS 常被挡、或 VPN 把解析劫持成 fake-IP）。
+    # 第 2 种必须继续登录，否则会像旧版那样：明明只是掉认证，却整轮跳过、一直不恢复。
+    $cached = ''
+    if (Test-Path $ipf) { $cached = (Get-Content $ipf -Raw).Trim() }
+    if (-not (Test-PortalReachable $cached)) {
+        Start-Sleep -Seconds 5
+        $code = Get-ProbeCode
+        if ($code -eq '204') { exit 0 }
+        if ($code -eq '000' -and -not (Test-PortalReachable $cached)) {
+            $last = ''
+            if (Test-Path $log) { $last = (Get-Content $log -Tail 1) -join '' }
+            if ($last -notmatch 'NETDOWN') { Write-Log 'NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过' }
+            exit 0
+        }
+    } else {
+        Write-Log "PROBE       probe=000 但门户可达（$cached），判定为掉认证而非断网，继续登录"
     }
-    if ($code -eq '204') { exit 0 }
 }
 
 # ---------- 第二步：确实需要重认证，这时才解析门户 IP ----------
+# 解析结果必须过校验：VPN/代理的 fake-IP 会把域名答成 198.18.x 这类地址，
+# 直接拿来登录必然失败，而且会把这个坏地址写进缓存、让下次也失败。
 $pip = ''
+$cachedIP = ''
+if (Test-Path $ipf) { $cachedIP = (Get-Content $ipf -Raw).Trim() }
 try {
     $a = [System.Net.Dns]::GetHostAddresses($phost) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
-    if ($a) { $pip = $a.IPAddressToString }
+    if ($a -and (Test-PortalIP $a.IPAddressToString)) { $pip = $a.IPAddressToString }
+    elseif ($a) { Write-Log "DNS        解析到 $($a.IPAddressToString)（不在可信范围，已忽略）" }
 } catch {}
-if (-not $pip -and (Test-Path $ipf)) { $pip = (Get-Content $ipf -Raw).Trim() }
+if (-not $pip -and (Test-PortalIP $cachedIP)) { $pip = $cachedIP }
 if ($pip) { Set-Content -Path $ipf -Value $pip -Encoding ASCII }
 
 # ---------- 第三步：定位网卡（纯 .NET，可移植，不写死网段）----------
@@ -128,7 +201,7 @@ $resolveArg = @()
 if ($pip) { $resolveArg = @('--resolve', "${phost}:${pport}:$pip") }
 
 function Invoke-Login([string]$m) {
-    return & curl.exe -4 -s -m 20 -G $portal @resolveArg `
+    return & curl.exe -4 --noproxy '*' -s -m 20 -G $portal @resolveArg `
         --data-urlencode 'c=Portal' `
         --data-urlencode 'a=login' `
         --data-urlencode 'callback=dr1003' `
@@ -156,7 +229,7 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
     if ($attempt -eq 2) {
         # 真实 MAC 被拒时，回退到门户页下发的 ss1 令牌值
         if (-not $macPage) {
-            $html = & curl.exe -4 -s -m 12 "http://$phost/" 2>$null
+            $html = & curl.exe -4 --noproxy '*' -s -m 12 "http://$phost/" 2>$null
             $joined = ($html -join "`n")
             $mm = [regex]::Match($joined, 'ss1="([0-9a-fA-F]{6,})"')
             if ($mm.Success) { $macPage = $mm.Groups[1].Value.ToLower() }
@@ -177,7 +250,9 @@ $short = ($resp -join ' ')
 if ($short.Length -gt 160) { $short = $short.Substring(0,160) }
 
 if ($after -eq '204') {
-    Write-Log "REAUTH OK   before=$code after=$after try=$try ip=$myip mac=$usedMac resp=$short"
+    Write-Log "REAUTH OK   before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip resp=$short"
+    # 认证已经成功，但系统可能仍显示"无 Internet / 需要操作"，这里主动唤醒一次判定
+    Repair-NetState $myip
 } else {
-    Write-Log "REAUTH FAIL before=$code after=$after try=$try ip=$myip mac=$usedMac resp=$short"
+    Write-Log "REAUTH FAIL before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip resp=$short"
 }

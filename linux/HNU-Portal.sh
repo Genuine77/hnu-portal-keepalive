@@ -23,12 +23,14 @@
 #   - 不再写死固定网段，改为"按到门户的路由"自动定位网卡:
 #       ip route get <门户IP>  →  dev / src
 #   - DNS 失效时用缓存的 portal IP + curl --resolve 兜底
-#   - 探测重试 3 次仍为 000 才判定不通，不盲目登录，只记一条 NETDOWN
+#   - 探测重试 3 次仍为 000 时，不直接判死：先看门户是否可达，可达就照常登录
+#     （未认证时 DNS 常被挡，或者被代理软件劫持成 fake-IP，这两种都不是真断网）
+#   - 解析到的门户地址必须过校验（回环/链路本地/组播/198.18.x 等一律不采纳、不入缓存）
 #   - 账号/密码存 600 root；密码输入不回显，明文不落脚本
 
 set -u
 
-VERSION='1.0.1'
+VERSION='1.0.2'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
@@ -119,24 +121,56 @@ cache_put() {
     ( printf '%s\n' "$2" > "$1" ) 2>/dev/null || true
 }
 
+# 地址可信性校验：回环、链路本地、组播/保留段、代理软件 fake-IP 段一律不采纳。
+# 这些地址一旦被当成门户地址，登录请求必然发进黑洞，看上去就像"认证失败"。
+valid_ip() {
+    case "$1" in
+        ''|0.*|127.*|169.254.*|198.18.*|198.19.*|2[2-5][0-9].*|255.*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    local o
+    for o in $(printf '%s' "$1" | tr '.' ' '); do
+        case "$o" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$((10#$o))" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# 不依赖 DNS，直接用 IP 判断门户是否可达：可达说明链路正常，只是还没认证
+portal_reachable() {
+    local ip code
+    ip=${1:-}
+    valid_ip "$ip" || return 1
+    code=$(curl -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o /dev/null -w '%{http_code}' \
+           --resolve "$PORTAL_HOST:$PORTAL_PORT:$ip" \
+           "http://$PORTAL_HOST:$PORTAL_PORT/eportal/" 2>/dev/null)
+    [ -n "$code" ] || code='000'
+    [ "$code" != '000' ]
+}
+
 # 解析门户域名，成功则刷新缓存；失败则回退缓存
 resolve_portal_ip() {
     local ip=''
     if have getent; then
         ip=$(getent ahostsv4 "$PORTAL_HOST" 2>/dev/null | awk 'NR==1{print $1}')
     fi
-    if [ -z "$ip" ] && have dig; then
+    if { [ -z "$ip" ] || ! valid_ip "$ip"; } && have dig; then
         ip=$(dig +short A "$PORTAL_HOST" 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
     fi
-    if [ -z "$ip" ] && have nslookup; then
+    if { [ -z "$ip" ] || ! valid_ip "$ip"; } && have nslookup; then
         ip=$(nslookup "$PORTAL_HOST" 2>/dev/null | awk '/^Address:[ \t]/{print $2}' | grep -E '^[0-9.]+$' | tail -n1)
     fi
-    if [ -n "$ip" ]; then
+    # 解析结果必须过校验才允许写缓存：开着代理软件时域名可能被答成 198.18.x，
+    # 这种地址一旦缓存下来，之后每次登录都会发进黑洞
+    if [ -n "$ip" ] && valid_ip "$ip"; then
         cache_put "$IP_CACHE" "$ip"
         printf '%s' "$ip"
         return 0
     fi
-    [ -r "$IP_CACHE" ] && { printf '%s' "$(tr -d ' \r\n' < "$IP_CACHE")"; return 0; }
+    if [ -r "$IP_CACHE" ]; then
+        ip=$(tr -d ' \r\n' < "$IP_CACHE")
+        if valid_ip "$ip"; then printf '%s' "$ip"; return 0; fi
+    fi
     printf ''
 }
 
@@ -169,7 +203,7 @@ detect_net() {
 # 单次探测，返回 "状态码|对端IP"
 probe_detail() {
     local out code ip
-    out=$(curl -4 -s -m 6 --connect-timeout 3 -o /dev/null \
+    out=$(curl -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o /dev/null \
           -w '%{http_code} %{remote_ip}' "$PROBE_URL" 2>/dev/null)
     code=$(printf '%s' "$out" | cut -d' ' -f1)
     ip=$(printf '%s' "$out" | cut -d' ' -f2)
@@ -205,7 +239,7 @@ probe() {
 
 # 门户首页里下发的 ss1（历史/令牌值），作为 MAC 被拒时的回退
 page_mac() {
-    curl -4 -s -m 12 "http://$PORTAL_HOST/" 2>/dev/null \
+    curl -4 --noproxy '*' -s -m 12 "http://$PORTAL_HOST/" 2>/dev/null \
         | tr -d '\r\n' \
         | grep -oE 'ss1="[0-9a-fA-F]{6,}"' \
         | head -n1 \
@@ -236,7 +270,7 @@ portal_login() {
     url="http://$PORTAL_HOST:$PORTAL_PORT/eportal/"
     resp_args=()
     [ -n "$pip" ] && resp_args=(--resolve "$PORTAL_HOST:$PORTAL_PORT:$pip")
-    curl -4 -s -m 20 -G "$url" \
+    curl -4 --noproxy '*' -s -m 20 -G "$url" \
         "${resp_args[@]+"${resp_args[@]}"}" \
         --data-urlencode 'c=Portal' \
         --data-urlencode 'a=login' \
@@ -290,24 +324,30 @@ do_run() {
     [ "$code" = '204' ] && exit 0
 
     if [ "$code" = '000' ]; then
-        sleep 5
-        code=$(probe)
-        if [ "$code" = '000' ]; then
-            local last='' d ip
-            [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
-            d=$(probe_detail); ip=${d##*|}
-            case "$last" in
-                *NETDOWN*) : ;;
-                *)
-                    case "$ip" in
-                        198.18.*|198.19.*) log_msg "NETDOWN    probe=000（DNS 被劫持到伪造地址 $ip，本轮跳过登录）" ;;
-                        *) log_msg "NETDOWN    probe=000（重试 3 次仍不通，本轮跳过登录）" ;;
-                    esac
-                    ;;
-            esac
-            exit 0
+        # probe=000 有两种情况：真断网，或 DNS 不可用（未认证时校园 DNS 常被挡，
+        # 也可能被代理软件劫持成 fake-IP）。后者必须继续登录，否则整轮跳过、一直不恢复。
+        if portal_reachable "$pip"; then
+            log_msg "PROBE      probe=000 但门户可达（$pip），判定为掉认证而非断网，继续登录"
+        else
+            sleep 5
+            code=$(probe)
+            [ "$code" = '204' ] && exit 0
+            if [ "$code" = '000' ] && ! portal_reachable "$pip"; then
+                local last='' d ip
+                [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
+                d=$(probe_detail); ip=${d##*|}
+                case "$last" in
+                    *NETDOWN*) : ;;
+                    *)
+                        case "$ip" in
+                            198.18.*|198.19.*) log_msg "NETDOWN    probe=000（DNS 被劫持到伪造地址 $ip，本轮跳过登录）" ;;
+                            *) log_msg "NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过" ;;
+                        esac
+                        ;;
+                esac
+                exit 0
+            fi
         fi
-        [ "$code" = '204' ] && exit 0
     fi
 
     mac="$MYMAC"
