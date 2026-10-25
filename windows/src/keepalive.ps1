@@ -1,4 +1,4 @@
-﻿# HNU 校园网自动保活（可移植版 v4）
+﻿# HNU 校园网自动保活（可移植版 v6）
 # 由 HNU-Portal.bat 释放到 %ProgramData%\HNU-Portal\ 后由计划任务以 SYSTEM 身份调用。
 # 也可单独运行：文件所在目录即为工作目录（凭据、日志都放在同目录）。
 #
@@ -19,6 +19,12 @@
 #   2. 解析到的门户 IP 必须过校验（排除回环、链路本地、组播与 198.18.0.0/15 等
 #      代理软件 fake-IP 段），坏地址不会写进缓存。
 #   3. 认证成功后主动唤醒 Windows 的联网判定（NCSI），避免网已通、任务栏仍显示断网。
+#
+# v6 变更（探测不再经过 DNS）：
+#   开着 VPN / 代理软件时，它们会把探针域名解析成 198.18.0.0/15 这类 fake-IP，
+#   请求随即被隧道接管。结果是「VPN 能不能上外网」冒充了「校园网通不通」：
+#   校园网早断了，探针照样回 204，脚本就地退出，一次也不会去重新认证。
+#   现在探针改用固定公网 IP 直连，并用响应里的 remote_ip 反查是否被劫持。
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -28,7 +34,8 @@ $uf     = Join-Path $base 'user.txt'
 $pf     = Join-Path $base 'pass.txt'
 $ipf    = Join-Path $base 'portal.ip'
 $log    = Join-Path $base 'keepalive.log'
-$probe  = 'http://connect.rom.miui.com/generate_204'
+$probeList = @('http://223.5.5.5/', 'http://119.29.29.29/')
+$script:lastProbe = ''
 $phost  = 'web.hnu.edu.cn'
 $pport  = '801'
 $portal = "http://$phost`:$pport/eportal/"
@@ -39,13 +46,34 @@ function Write-Log([string]$msg) {
 }
 
 function Get-ProbeCode {
-    # 单次探测可能被上游丢掉连接（本机并未掉线时也会返回 000），因此重试 3 次
-    for ($i = 1; $i -le 3; $i++) {
-        $c = & curl.exe -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o NUL -w '%{http_code}' $probe 2>$null
-        if ([string]::IsNullOrWhiteSpace($c)) { $c = '000' }
-        $c = "$c".Trim()
-        if ($c -eq '204' -or $c -eq '302') { return $c }
-        if ($i -lt 3) { Start-Sleep -Seconds 1 }
+    # 返回 204=在线 / 302=掉认证（被重定向到门户）/ 000=不通或探测不可信。
+    # 探针刻意用固定公网 IP 而不是域名：域名一旦被 VPN 的 fake-IP 改写，
+    # 探测的就变成了隧道出口，校园网状态完全测不出来。
+    for ($round = 1; $round -le 2; $round++) {
+        foreach ($t in $probeList) {
+            # 单次探测可能被上游丢掉连接（本机并未掉线时也会返回 000），故每目标重试
+            $o = & curl.exe -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o NUL `
+                 -w '%{http_code}|%{remote_ip}|%{redirect_url}' $t 2>$null
+            if ([string]::IsNullOrWhiteSpace($o)) { $o = '000||' }
+            $p   = "$o".Trim().Split('|')
+            $c   = $p[0]
+            $rip = if ($p.Count -gt 1) { $p[1] } else { '' }
+            $rdr = if ($p.Count -gt 2) { $p[2] } else { '' }
+            $script:lastProbe = "$($t -replace '^https?://','') -> $c remote=$rip"
+
+            if ($c -ne '000') {
+                if ($rip -and -not (Test-PortalIP $rip)) {
+                    # 响应来自 fake-IP 段，说明这一发被隧道吸走了，结果不可信
+                    $script:lastProbe = "$($t -replace '^https?://','') -> $c remote=$rip（fake-IP，结果丢弃）"
+                    continue
+                }
+                # 被改写去认证页 = 掉认证
+                if ($rdr -match '(?i)(hnu\.edu\.cn|eportal|wlanuserip)') { return '302' }
+                # 拿到目标自己的真实响应（223.5.5.5 回 404，1.1.1.1 回 301）= 出网正常
+                return '204'
+            }
+        }
+        if ($round -lt 2) { Start-Sleep -Seconds 1 }
     }
     return '000'
 }
@@ -137,7 +165,7 @@ if ($code -eq '000') {
         if ($code -eq '000' -and -not (Test-PortalReachable $cached)) {
             $last = ''
             if (Test-Path $log) { $last = (Get-Content $log -Tail 1) -join '' }
-            if ($last -notmatch 'NETDOWN') { Write-Log 'NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过' }
+            if ($last -notmatch 'NETDOWN') { Write-Log "NETDOWN    probe=000 且门户不可达（链路确实不通），本轮跳过 | $($script:lastProbe)" }
             exit 0
         }
     } else {
@@ -173,6 +201,8 @@ foreach ($dst in @($pip, '223.5.5.5')) {
         $myip = $sock.LocalEndPoint.Address.ToString()
         $sock.Close()
     } catch { $myip = '' }
+    # 走 VPN 的链路会把源地址给成 198.18.x / 169.254.x，这种地址拿去登录必然失败
+    if ($myip -and -not (Test-PortalIP $myip)) { $myip = '' }
     if ($myip) { break }
 }
 
@@ -229,7 +259,7 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
     if ($attempt -eq 2) {
         # 真实 MAC 被拒时，回退到门户页下发的 ss1 令牌值
         if (-not $macPage) {
-            $html = & curl.exe -4 --noproxy '*' -s -m 12 "http://$phost/" 2>$null
+            $html = & curl.exe -4 --noproxy '*' -s -m 12 @resolveArg "http://$phost/" 2>$null
             $joined = ($html -join "`n")
             $mm = [regex]::Match($joined, 'ss1="([0-9a-fA-F]{6,})"')
             if ($mm.Success) { $macPage = $mm.Groups[1].Value.ToLower() }
@@ -243,6 +273,9 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
     Start-Sleep -Seconds 3
     $after = Get-ProbeCode
     if ($after -eq '204') { break }
+    # 门户回「该 IP 已经在线」= 本机并没有掉线（多半是探测偶发误判），
+    # 换 MAC 再试也是同一个答复，直接收工。
+    if (("$resp") -match '"ret_code"\s*:\s*2') { break }
     if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
 }
 
@@ -250,9 +283,11 @@ $short = ($resp -join ' ')
 if ($short.Length -gt 160) { $short = $short.Substring(0,160) }
 
 if ($after -eq '204') {
-    Write-Log "REAUTH OK   before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip resp=$short"
+    Write-Log "REAUTH OK   before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip probe=$($script:lastProbe) resp=$short"
     # 认证已经成功，但系统可能仍显示"无 Internet / 需要操作"，这里主动唤醒一次判定
     Repair-NetState $myip
+} elseif (("$resp") -match '"ret_code"\s*:\s*2') {
+    Write-Log "REAUTH SKIP before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip probe=$($script:lastProbe) note=门户返回已在线 resp=$short"
 } else {
-    Write-Log "REAUTH FAIL before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip resp=$short"
+    Write-Log "REAUTH FAIL before=$code after=$after try=$try ip=$myip mac=$usedMac portal=$pip probe=$($script:lastProbe) resp=$short"
 }

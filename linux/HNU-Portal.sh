@@ -27,14 +27,20 @@
 #     （未认证时 DNS 常被挡，或者被代理软件劫持成 fake-IP，这两种都不是真断网）
 #   - 解析到的门户地址必须过校验（回环/链路本地/组播/198.18.x 等一律不采纳、不入缓存）
 #   - 账号/密码存 600 root；密码输入不回显，明文不落脚本
+#
+# v1.0.3 变更:
+#   探针不再走域名。VPN/代理软件会把域名解析成 198.18.0.0/15 这类 fake-IP，
+#   请求被隧道接管，于是"VPN 能不能上网"冒充了"校园网通不通"——校园网断了
+#   探针照样回 204，脚本就地退出、永不重认证。改用固定公网 IP 直连，
+#   并用响应里的对端地址反查是否被劫持。
 
 set -u
 
-VERSION='1.0.2'
+VERSION='1.0.3'
 
 PORTAL_HOST='web.hnu.edu.cn'
 PORTAL_PORT='801'
-PROBE_URL='http://connect.rom.miui.com/generate_204'
+PROBE_URLS='http://223.5.5.5/ http://119.29.29.29/'
 
 CONF_DIR='/etc/hnu-portal'
 USER_FILE="$CONF_DIR/user"
@@ -200,46 +206,54 @@ detect_net() {
     [ -n "$MYMAC" ] && cache_put "$MAC_CACHE" "$MYMAC"
 }
 
-# 单次探测，返回 "状态码|对端IP"
+# 单次探测，返回 "状态码|对端IP|跳转地址"
 probe_detail() {
-    local out code ip
+    local url=$1 out code ip rdr
     out=$(curl -4 --noproxy '*' -s -m 6 --connect-timeout 3 -o /dev/null \
-          -w '%{http_code} %{remote_ip}' "$PROBE_URL" 2>/dev/null)
-    code=$(printf '%s' "$out" | cut -d' ' -f1)
-    ip=$(printf '%s' "$out" | cut -d' ' -f2)
+          -w '%{http_code}|%{remote_ip}|%{redirect_url}' "$url" 2>/dev/null)
+    code=$(printf '%s' "$out" | cut -d'|' -f1)
+    ip=$(printf '%s' "$out" | cut -d'|' -f2)
+    rdr=$(printf '%s' "$out" | cut -d'|' -f3)
     [ -z "$code" ] && code='000'
-    printf '%s|%s' "$code" "$ip"
+    printf '%s|%s|%s' "$code" "$ip" "$rdr"
 }
 
-# 探测（带重试）：拿到 204/302 就返回
-# 两种情况下重试而不是直接判死：
-#   1) 000：上游偶发丢弃 SYN，本机其实没掉线（实测首次连接较容易踩中）
-#   2) 解析落在 198.18.0.0/15：代理软件 fake-IP 劫持 DNS 时返回的伪造地址，
-#      发出去必然无回应，必须丢弃重解析
+# 探测：返回 204=在线 / 302=掉认证 / 000=不通或探测不可信
+# 探针用固定公网 IP 而不是域名，避免被代理软件的 fake-IP 改写目标；
+# 若对端地址仍落在 198.18.0.0/15，说明这一发被隧道吸走，结果丢弃。
 probe() {
-    local i d code ip
-    i=1
-    while [ "$i" -le 3 ]; do
-        d=$(probe_detail)
-        code=${d%%|*}
-        ip=${d##*|}
-        case "$code" in
-            204|302)
-                case "$ip" in
-                    198.18.*|198.19.*) ;;
-                    *) printf '%s' "$code"; return 0 ;;
-                esac
-                ;;
-        esac
-        [ "$i" -lt 3 ] && sleep 1
-        i=$((i + 1))
+    local round i d code ip rdr url rest
+    for round in 1 2; do
+        for url in $PROBE_URLS; do
+            i=1
+            while [ "$i" -le 2 ]; do
+                d=$(probe_detail "$url")
+                code=${d%%|*}; rest=${d#*|}; ip=${rest%%|*}; rdr=${rest#*|}
+                if [ "$code" != '000' ]; then
+                    case "$ip" in
+                        198.18.*|198.19.*) : ;;   # fake-IP，结果不可信
+                        *)
+                            case "$rdr" in
+                                *hnu.edu.cn*|*eportal*|*wlanuserip*) printf '302'; return 0 ;;
+                                *) printf '204'; return 0 ;;
+                            esac
+                            ;;
+                    esac
+                fi
+                [ "$i" -lt 2 ] && sleep 1
+                i=$((i + 1))
+            done
+        done
     done
     printf '000'
 }
 
 # 门户首页里下发的 ss1（历史/令牌值），作为 MAC 被拒时的回退
+# 同样走 --resolve，避免域名被代理软件的 fake-IP 改写
 page_mac() {
-    curl -4 --noproxy '*' -s -m 12 "http://$PORTAL_HOST/" 2>/dev/null \
+    local args=()
+    if [ -n "${pip:-}" ]; then args=(--resolve "$PORTAL_HOST:80:$pip"); fi
+    curl -4 --noproxy '*' ${args[@]+"${args[@]}"} -s -m 12 "http://$PORTAL_HOST/" 2>/dev/null \
         | tr -d '\r\n' \
         | grep -oE 'ss1="[0-9a-fA-F]{6,}"' \
         | head -n1 \
@@ -333,9 +347,9 @@ do_run() {
             code=$(probe)
             [ "$code" = '204' ] && exit 0
             if [ "$code" = '000' ] && ! portal_reachable "$pip"; then
-                local last='' d ip
+                local last='' d ip rest
                 [ -f "$LOG_FILE" ] && last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
-                d=$(probe_detail); ip=${d##*|}
+                d=$(probe_detail "${PROBE_URLS%% *}"); rest=${d#*|}; ip=${rest%%|*}
                 case "$last" in
                     *NETDOWN*) : ;;
                     *)
@@ -373,6 +387,8 @@ do_run() {
         sleep 3
         after=$(probe)
         [ "$after" = '204' ] && break
+        # 门户回「该 IP 已经在线」= 本机并没有掉线，换 MAC 再试也是同一答复
+        case "$resp" in *'"ret_code":2'*) break ;; esac
         [ "$i" -lt 3 ] && sleep 5
         i=$((i + 1))
     done
@@ -382,7 +398,12 @@ do_run() {
     if [ "$after" = '204' ]; then
         log_msg "REAUTH OK   before=$code after=$after try=$try ip=$MYIP mac=$mac if=$MYDEV resp=$short"
     else
-        log_msg "REAUTH FAIL before=$code after=$after try=$try ip=$MYIP mac=$mac if=$MYDEV resp=$short"
+        case "$resp" in
+            *'"ret_code":2'*)
+                log_msg "REAUTH SKIP before=$code after=$after try=$try ip=$MYIP mac=$mac if=$MYDEV note=门户返回已在线 resp=$short" ;;
+            *)
+                log_msg "REAUTH FAIL before=$code after=$after try=$try ip=$MYIP mac=$mac if=$MYDEV resp=$short" ;;
+        esac
     fi
     exit 0
 }
@@ -746,7 +767,7 @@ act_selftest() {
     fi
     say ''
     c=$(probe)
-    say "探测 generate_204 : $c  $( case $c in 204) echo '(已认证)';; 302) echo '(未认证)';; 000) echo '(不通)';; *) echo '';; esac )"
+    say "探针 223.5.5.5    : $c  $( case $c in 204) echo '(已认证)';; 302) echo '(未认证)';; 000) echo '(不通 / 探测不可信)';; *) echo '';; esac )"
     say ''
     if [ -r "$USER_FILE" ]; then
         who=$(tr -d '\r\n' < "$USER_FILE"); say "凭据              : 已配置（账号 $(mask_user "$who")）"
