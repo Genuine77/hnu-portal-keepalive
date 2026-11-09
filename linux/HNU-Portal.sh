@@ -44,6 +44,17 @@
 #   缓存从 /run（tmpfs，重启即空）搬到 /etc/hnu-portal，跨重启保留。
 #   此前每次重启后缓存都是空的，v1.0.4 的"缓存优先"在开机第一轮完全失效，
 #   只能退回解析域名；若此时 DNS 恰被代理软件劫持，就会一直登不上。升级时自动搬运旧缓存。
+#
+# v1.0.7 变更（与 Windows 端同源）:
+#   修三处在代理软件 TUN（虚拟网卡）模式下会失效的地方：
+#   1. 门户地址缓存验不过时不再删除。原来验不过就 rm，一旦 DNS 同时被劫持成
+#      fake-IP，下一轮连候选地址都没有，从此彻底失去自愈能力。
+#   2. 门户域名优先直接问内网 DNS。系统解析器在 TUN 下只回 198.18.x 这类 fake-IP，
+#      问了也白问。DNS 来源兼容 systemd-resolved：/etc/resolv.conf 只有一个
+#      127.0.0.53 桩，真实上游在 /run/systemd/resolve/ 与 resolvectl 里。
+#   3. 本机出口 IP 增加可信性校验，并排除隧道网卡与容器网桥。原来 ip route get
+#      1.1.1.1 拿到的隧道地址（198.18.x / tun0）会被当作校园网 IP 直接提交登录，
+#      必然失败；退路枚举时也可能选到 docker0 的 172.17.0.1。
 
 set -u
 
@@ -177,6 +188,16 @@ valid_ip() {
     return 0
 }
 
+# 私有地址判断（10/8、172.16/12、192.168/16），用于筛出内网 DNS
+is_private_ip() {
+    case "${1:-}" in
+        10.*) return 0 ;;
+        192.168.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    esac
+    return 1
+}
+
 # 不依赖 DNS，直接用 IP 判断门户是否可达：可达说明链路正常，只是还没认证
 portal_reachable() {
     local ip code
@@ -202,11 +223,59 @@ portal_identity() {
     printf '%s' "$body" | grep -qi 'eportal'
 }
 
-# 域名解析出的候选地址（去重）
+# 判断网卡是不是代理软件的 TUN 设备：名字有特征，或持有 198.18/198.19 段地址。
+# 这类网卡上的地址是隧道地址，拿去登录必然失败，也绝不能当成"本机校园网 IP"。
+is_tunnel_dev() {
+    local d=${1:-}
+    [ -n "$d" ] || return 1
+    case "$d" in
+        tun*|tap*|utun*|Meta|meta|mihomo*|clash*|sing*) return 0 ;;
+    esac
+    ip -4 -o addr show dev "$d" 2>/dev/null \
+        | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+' | cut -d/ -f1 \
+        | grep -qE '^198\.(18|19)\.' && return 0
+    return 1
+}
+
+# 判断网卡是不是容器/网桥一类的虚拟设备，避免把 docker0、br-* 的地址当成出口
+is_virtual_dev() {
+    case "${1:-}" in
+        docker*|veth*|br-*|virbr*|lxc*|lxd*|vmnet*|vboxnet*|podman*|cni*|flannel*|kube*) return 0 ;;
+    esac
+    return 1
+}
+
+# 列出内网 DNS。公网 DNS 在代理软件 TUN 下同样会被劫持成 fake-IP，问了也白问；
+# 而 systemd-resolved 的 /etc/resolv.conf 只有一个 127.0.0.53 桩，真实上游在
+# /run/systemd/resolve/resolv.conf 和 resolvectl dns 里，必须一并读。
+campus_dns_list() {
+    {
+        for f in /etc/resolv.conf \
+                 /run/systemd/resolve/resolv.conf \
+                 /run/systemd/resolve/stub-resolv.conf; do
+            awk '/^[[:space:]]*nameserver[[:space:]]/{print $2}' "$f" 2>/dev/null
+        done
+        have resolvectl && resolvectl dns 2>/dev/null \
+            | sed -E 's/^[^:]*:[[:space:]]*//' | tr ' ' '\n'
+    } 2>/dev/null \
+        | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' \
+        | while read -r s; do is_private_ip "$s" && printf '%s\n' "$s"; done \
+        | awk '!seen[$0]++'
+}
+
+# 域名解析出的候选地址（去重）。先直接问内网 DNS：
+# 代理软件 TUN 开着时，系统解析器只会给出 198.18.x 这类 fake-IP。
 portal_candidates() {
-    { have getent   && getent ahostsv4 "$PORTAL_HOST" 2>/dev/null | awk '{print $1}'
-      have dig      && dig +short A "$PORTAL_HOST" 2>/dev/null
-      have nslookup && nslookup "$PORTAL_HOST" 2>/dev/null | awk '/^Address:[ \t]/{print $2}'
+    local s
+    {
+        for s in $(campus_dns_list); do
+            if have dig;        then dig +short +time=2 +tries=1 A "$PORTAL_HOST" "@$s" 2>/dev/null
+            elif have nslookup; then nslookup "$PORTAL_HOST" "$s" 2>/dev/null | awk '/^Address:[ \t]/{print $2}'
+            fi
+        done
+        have getent   && getent ahostsv4 "$PORTAL_HOST" 2>/dev/null | awk '{print $1}'
+        have dig      && dig +short A "$PORTAL_HOST" 2>/dev/null
+        have nslookup && nslookup "$PORTAL_HOST" 2>/dev/null | awk '/^Address:[ \t]/{print $2}'
     } 2>/dev/null | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | awk '!seen[$0]++'
 }
 
@@ -220,8 +289,8 @@ resolve_portal_ip() {
             printf '%s' "$ip"; return 0
         fi
     fi
-    # 缓存不可信时顺手清掉，免得一个坏地址一直留在盘上
-    rm -f "$IP_CACHE" 2>/dev/null || true
+    # 缓存验不过时**不删除**：删掉之后下一轮连候选都没有，
+    # 一旦 DNS 也被劫持就彻底失去自愈能力。只跳过，等下一轮再验。
     # 2) 缓存不可用才解析；候选必须自证是门户，才允许写进缓存
     for cand in $(portal_candidates); do
         if portal_identity "$cand"; then
@@ -242,18 +311,60 @@ route_field() {   # $1=目标IP  $2=dev|src
 
 # 定位"能把包发到门户的那张网卡"及其 IP / MAC
 detect_net() {
-    local pip dev
+    local pip dev sip d a
     MYIP=''; MYDEV=''; MYMAC=''
+
+    # 1) 直接问"去门户走哪张网卡"。门户在内网，正常情况下这一步就是答案，
+    #    而且代理软件通常把私网段排除在隧道外，所以它不受 TUN 影响。
     pip=$(resolve_portal_ip)
     if [ -n "$pip" ]; then
         dev=$(route_field "$pip" dev)
-        MYIP=$(route_field "$pip" src)
+        sip=$(route_field "$pip" src)
+        if [ -n "$sip" ] && valid_ip "$sip" && ! is_tunnel_dev "$dev"; then
+            MYIP=$sip; MYDEV=$dev
+        fi
     fi
+
+    # 2) 退一步问"去公网走哪张网卡"。TUN 开着时这里拿到的是隧道地址
+    #    （198.18.x / tun0），必须挡掉，否则登录请求会带着假 IP 发出去。
     if [ -z "$MYIP" ]; then
         dev=$(route_field 1.1.1.1 dev)
-        MYIP=$(route_field 1.1.1.1 src)
+        sip=$(route_field 1.1.1.1 src)
+        if [ -n "$sip" ] && valid_ip "$sip" && ! is_tunnel_dev "$dev"; then
+            MYIP=$sip; MYDEV=$dev
+        fi
     fi
-    MYDEV="$dev"
+
+    # 3) 前两步都拿不到时，优先挑"有默认路由"的网卡，避免选到 docker0 / br-* 这类网桥
+    if [ -z "$MYIP" ]; then
+        for d in $(ip route show default 2>/dev/null \
+                   | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | awk '!seen[$0]++'); do
+            is_tunnel_dev "$d" && continue
+            a=$(ip -4 -o addr show dev "$d" 2>/dev/null \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/' | head -n1 | tr -d '/')
+            [ -n "$a" ] || continue
+            valid_ip "$a" || continue
+            MYIP=$a; MYDEV=$d
+            break
+        done
+    fi
+
+    # 4) 最后枚举物理网卡，排除隧道与容器虚拟设备
+    if [ -z "$MYIP" ]; then
+        for d in /sys/class/net/*; do
+            d=$(basename "$d")
+            is_tunnel_dev "$d" && continue
+            is_virtual_dev "$d" && continue
+            [ "$(cat "/sys/class/net/$d/operstate" 2>/dev/null)" = 'up' ] || continue
+            a=$(ip -4 -o addr show dev "$d" 2>/dev/null \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/' | head -n1 | tr -d '/')
+            [ -n "$a" ] || continue
+            valid_ip "$a" || continue
+            MYIP=$a; MYDEV=$d
+            break
+        done
+    fi
+
     if [ -n "$MYDEV" ] && [ -r "/sys/class/net/$MYDEV/address" ]; then
         MYMAC=$(tr -d ':\r\n' < "/sys/class/net/$MYDEV/address")
     fi
