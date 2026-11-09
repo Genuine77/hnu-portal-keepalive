@@ -85,6 +85,42 @@ findstr /C:"ReadAllText" HNU-Portal.bat >nul && echo 新写法（分片写文件
   Select StartWhenAvailable, ExecutionTimeLimit, MultipleInstances
 ```
 
+## Windows：开着 VPN / 代理软件（TUN 模式）时一直认证不上
+
+典型表现是每轮只重复这三行，反复很久也不恢复，关掉代理软件后立刻就好了：
+
+```
+DNS    解析到 198.18.0.16（不在可信范围，已忽略）
+PORTAL 缓存与 DNS 均未验证出门户地址，本轮不带地址尝试登录
+NOIP   before=302 无法确定本机出口 IP，本轮跳过
+```
+
+v1.0.7 起已内置处理，正常情况下不需要再管。先跑一次诊断看当前判断过程：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\HNU-Portal\keepalive.ps1 -Diag
+```
+
+重点看三行：
+
+- `隧道网卡 ifIndex`：检测到的代理隧道网卡
+- `探针路由`：`ifIndex` 指向物理网卡才对；显示「走隧道」并且下面紧跟
+  `ROUTE 探针 … 仍被隧道接管` 时，说明代理软件开了 strict-route 或防火墙强制接管，
+  路由表层面绕不过去，只能关掉 TUN 才能稳定认证
+- `探针实发`：`src=` 应该是校园网网卡地址（形如 `10.x.x.x`），
+  `src=198.18.x.x` 说明这一发还在走隧道
+
+**为什么开 TUN 会坏**
+
+- 代理软件把 `0.0.0.0/0` 接管后，公网探针走的是隧道，测到的是「代理能不能上外网」，
+  而不是「校园网通不通」；
+- 求本机出口 IP 时，内核给出的是隧道源地址 `198.18.0.1`，被判定不可信后整轮跳过；
+- DNS 被改成 fake-IP，门户域名恒解析成 `198.18.x`。
+
+`--noproxy '*'` 对以上三种情况全部无效——它只关应用层 HTTP 代理，管不了 IP 层劫持和
+DNS 劫持。v1.0.7 的做法是给探针加 `/32` 路由指回物理网关（Windows 按最长前缀匹配，
+`/32` 必然优先于隧道的 `/1`、`/8` 网段），出口 IP 改为向内网门户询问，门户域名只查内网 DNS。
+
 ## Windows：任务在跑但网络没恢复
 
 确认任务运行身份：
